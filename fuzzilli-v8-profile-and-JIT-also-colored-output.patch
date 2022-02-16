@@ -1,0 +1,596 @@
+diff --git a/Cloud/Docker/Dockerfile b/Cloud/Docker/Dockerfile
+index 093e342..c2005ef 100644
+--- a/Cloud/Docker/Dockerfile
++++ b/Cloud/Docker/Dockerfile
+@@ -16,10 +16,12 @@ WORKDIR /home/fuzzer
+ ADD FuzzilliBuilder/out/Fuzzilli Fuzzilli
+ 
+ # Add JavaScriptCore binary
+-ADD JSCBuilder/out jsc
++#ADD JSCBuilder/out jsc
+ # Add Spidermonkey binary
+-ADD SpidermonkeyBuilder/out spidermonkey
++#ADD SpidermonkeyBuilder/out spidermonkey
+ # Add v8 binary
+ ADD V8Builder/out v8
+ 
+ RUN mkdir fuzz
++
++ADD state.json state.json
+diff --git a/Cloud/GCE/config.sh b/Cloud/GCE/config.sh
+index a072919..b3f64c5 100644
+--- a/Cloud/GCE/config.sh
++++ b/Cloud/GCE/config.sh
+@@ -6,17 +6,20 @@
+ #
+ 
+ # The GCP project to use. See https://cloud.google.com/resource-manager/docs/creating-managing-projects#identifying_projects
+-PROJECT_ID=YOUR_PROJECT_ID
+-PROJECT_NUMBER=YOUR_PROJECT_NUMBER
++PROJECT_ID="fuzzilli-v8-jit-oriented"
++PROJECT_NUMBER=822868274068
++
++# The instances user when connecting via SSH
++SSH_USER="javijmor_gmail_com"
+ 
+ # The name of the session, can be an arbitrary string.
+ # This also serves as the prefix for instance names. For example, the root instance will be named $SESSION-root.
+-SESSION="fuzzilli"
++SESSION="fuzzilliv8"
+ 
+ # The path to the JavaScript engine binary in the container
+-BINARY=./d8
++BINARY=./v8/d8
+ # Common arguments to pass to every Fuzzilli instance. See ./Fuzzilli --help
+-FUZZILLI_ARGS="--profile=v8"
++FUZZILLI_ARGS="--profile=v8 --minimizationLimit=2 --importState=./state.json --exportState"
+ 
+ # Region and zone where compute instances are created. See https://cloud.google.com/compute/docs/regions-zones
+ REGION=us-east1
+@@ -26,14 +29,16 @@ ZONE=$REGION-b
+ SERVICE_ACCOUNT=$PROJECT_NUMBER-compute@developer.gserviceaccount.com
+ 
+ # The machine image and docker container to use.
+-IMAGE=cos-stable-81-12871-103-0
++# IMAGE=cos-stable-81-12871-130-0
++IMAGE=cos-stable-81-12871-119-0
++# IMAGE=cos-stable-81-12871-117-0
+ CONTAINER_NAME=fuzzilli
+ CONTAINER_IMAGE=gcr.io/$PROJECT_ID/$CONTAINER_NAME:latest
+ 
+ # Number of master instances (N)
+-NUM_MASTERS=8
++NUM_MASTERS=1
+ # Number of worker instances per master (M)
+-NUM_WORKERS_PER_MASTER=16
++NUM_WORKERS_PER_MASTER=20
+ 
+ # 2 cores, 8 GB
+ ROOT_MACHINE_TYPE=e2-standard-2
+diff --git a/Cloud/GCE/start.sh b/Cloud/GCE/start.sh
+index 9d03fc6..c8046e5 100755
+--- a/Cloud/GCE/start.sh
++++ b/Cloud/GCE/start.sh
+@@ -43,6 +43,13 @@ do
+     shift
+ done
+ 
++if (( $NUM_WORKERS_PER_MASTER % $WORKER_INSTANCES_PER_MACHINE != 0 )); then
++    echo " $NUM_WORKERS_PER_MASTER, $WORKER_INSTANCES_PER_MACHINE "
++    echo "$(($NUM_WORKERS_PER_MASTER % $WORKER_INSTANCES_PER_MACHINE))"
++    echo "[!] M is not divisible by the number of fuzzer instances per machine"
++    exit 1
++fi
++
+ #
+ # Start root instance
+ #
+@@ -69,8 +76,8 @@ if [ "$START_ROOT" = true ]; then
+         --container-privileged \
+         --container-command=/bin/bash \
+         --container-arg="-c" \
+-        --container-arg="sysctl -w 'kernel.core_pattern=|/bin/false' && ./Fuzzilli --networkMaster=0.0.0.0:1337 --storagePath=/home/fuzzer/fuzz $IMPORT_CORPUS $FUZZILLI_ARGS $BINARY" \
+-        --container-mount-host-path=mount-path=/home/fuzzer/fuzz,host-path=/home/$USER/fuzz,mode=rw \
++        --container-arg="sysctl -w 'kernel.core_pattern=|/bin/false' && ./Fuzzilli --networkMaster=0.0.0.0:12345 --storagePath=/home/fuzzer/fuzz $IMPORT_CORPUS $FUZZILLI_ARGS $BINARY" \
++        --container-mount-host-path=mount-path=/home/fuzzer/fuzz,host-path=/home/$SSH_USER/fuzz,mode=rw \
+         --container-tty \
+         --labels=container-vm=$IMAGE,role=root,session=$SESSION
+ fi
+@@ -108,7 +115,7 @@ if [ "$START_MASTERS" = true ]; then
+         --container-privileged \
+         --container-command=/bin/bash \
+         --container-arg="-c" \
+-        --container-arg="sysctl -w 'kernel.core_pattern=|/bin/false' && ./Fuzzilli --networkWorker=$ROOT_IP:1337 --networkMaster=0.0.0.0:1337 $FUZZILLI_ARGS $BINARY" \
++        --container-arg="sysctl -w 'kernel.core_pattern=|/bin/false' && ./Fuzzilli --storagePath=/home/fuzzer/fuzz --networkWorker=$ROOT_IP:12345 --networkMaster=0.0.0.0:12345 $FUZZILLI_ARGS $BINARY" \
+         --container-tty \
+         --labels=container-vm=$IMAGE,role=master,session=$SESSION
+ fi
+@@ -156,7 +163,7 @@ if [ "$START_WORKERS" = true ]; then
+             --container-privileged \
+             --container-command=/bin/bash \
+             --container-arg="-c" \
+-            --container-arg="sysctl -w 'kernel.core_pattern=|/bin/false' && for i in {1..$WORKER_INSTANCES_PER_MACHINE}; do ./Fuzzilli --logLevel=warning --networkWorker=$MASTER_IP:1337 $FUZZILLI_ARGS $BINARY & done; wait" \
++            --container-arg="sysctl -w 'kernel.core_pattern=|/bin/false' && for i in {1..$WORKER_INSTANCES_PER_MACHINE}; do ./Fuzzilli --storagePath=/home/fuzzer/fuzz --logLevel=warning --networkWorker=$MASTER_IP:12345 $FUZZILLI_ARGS $BINARY & done; wait" \
+             --container-tty \
+             --labels=container-vm=$IMAGE,role=worker,session=$SESSION
+     done <<< "$MASTER_IPS"
+diff --git a/Cloud/fuzzilli_runner.sh b/Cloud/fuzzilli_runner.sh
+index f8e34d0..90d8f65 100755
+--- a/Cloud/fuzzilli_runner.sh
++++ b/Cloud/fuzzilli_runner.sh
+@@ -19,7 +19,7 @@ sudo sysctl -w 'kernel.core_pattern=|/bin/false'
+ 
+ if [ "$ismaster" == "yes" ]; then
+ 	echo "[+] Starting master $i"
+-	screen -S fuzzilli -t "master" -X screen -d -m -- ./Docker/FuzzilliBuilder/out/Fuzzilli --storagePath=$storagepath --timeout=$timeout --networkMaster=0.0.0.0:12345 --networkWorker=35.185.90.223:12345 --exportState --profile=v8 $d8path
++	screen -S fuzzilli -t "master" -X screen -d -m -- ./Docker/FuzzilliBuilder/out/Fuzzilli --storagePath=$storagepath --timeout=$timeout --networkMaster=$masterip:12345 --exportState --profile=v8 $d8path
+ 	sleep 5
+ else
+ 	echo "[+] Master ip is $masterip"
+diff --git a/Sources/Fuzzilli/Core/CodeGenerators.swift b/Sources/Fuzzilli/Core/CodeGenerators.swift
+index b380fe8..a63eda8 100644
+--- a/Sources/Fuzzilli/Core/CodeGenerators.swift
++++ b/Sources/Fuzzilli/Core/CodeGenerators.swift
+@@ -352,7 +352,7 @@ public func ThrowGenerator(_ b: ProgramBuilder) {
+ 
+ public func TypedArrayGenerator(_ b: ProgramBuilder) {
+     let size = b.loadInt(Int.random(in: 0...0x10000))
+-    let constructor = b.loadBuiltin(chooseUniform(from: ["Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "Uint8ClampedArray", "DataView"]))
++    let constructor = b.loadBuiltin(chooseUniform(from: ["Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "Uint8ClampedArray", "BigInt64Array", "BigUint64Array", "DataView"]))
+     b.construct(constructor, withArgs: [size])
+ }
+ 
+diff --git a/Sources/Fuzzilli/Core/FuzzerCore.swift b/Sources/Fuzzilli/Core/FuzzerCore.swift
+index 0b93706..c852329 100644
+--- a/Sources/Fuzzilli/Core/FuzzerCore.swift
++++ b/Sources/Fuzzilli/Core/FuzzerCore.swift
+@@ -136,7 +136,8 @@ public class FuzzerCore: ComponentBase {
+         for _ in 0..<numConsecutiveMutations {
+             var mutator = chooseUniform(from: mutators)
+             var mutated = false
+-            for _ in 0..<100 {
++            // Try to give all mutators N chances
++            for _ in 0..<(mutators.count*3) {
+                 if let result = mutator.mutate(parent, for: fuzzer) {
+                     program = result
+                     mutated = true
+@@ -146,8 +147,29 @@ public class FuzzerCore: ComponentBase {
+                 mutator = chooseUniform(from: mutators)
+                 
+             }
++
++            if !mutated {
++                logger.warning("Could not mutate sample, iterating all mutators one by one.")
++                program = parent
++            }
++
++            // If the mutation failed, ensure we used, at least once, all the mutators. 
++            // It's not exhaustive, but caters for the reduction of iterations in the previous for loop.
++            var auxmutators = mutators
++            while !auxmutators.isEmpty && !mutated {
++                var mutator = chooseUniform(from: auxmutators)
++                auxmutators = auxmutators.filter { type(of: $0) != type(of: mutator) }
++                print("Count: \(auxmutators.count)")
++                if let result = mutator.mutate(parent, for: fuzzer) {
++                    program = result
++                    mutated = true
++                    break
++                }
++                mutator = chooseUniform(from: auxmutators)
++            }
++
+             if !mutated {
+-                logger.warning("Could not mutate sample, giving up. Sampe:\n\(fuzzer.lifter.lift(parent))")
++                logger.warning("Could not mutate sample, giving up. Sample:\n\(fuzzer.lifter.lift(parent))")
+                 program = parent
+             }
+     
+diff --git a/Sources/Fuzzilli/Core/JavaScriptEnvironment.swift b/Sources/Fuzzilli/Core/JavaScriptEnvironment.swift
+index 7d2a32f..399e4b4 100644
+--- a/Sources/Fuzzilli/Core/JavaScriptEnvironment.swift
++++ b/Sources/Fuzzilli/Core/JavaScriptEnvironment.swift
+@@ -23,7 +23,7 @@ public class JavaScriptEnvironment: ComponentBase, Environment {
+                                       -1073741824, -536870912, -268435456,                              // -2**32 / {4, 8, 16}
+                                       -65537, -65536, -65535,                                           // -2**16
+                                       -4096, -1024, -256, -128,                                         // Other powers of two
+-                                      -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 64,                 // Numbers around 0
++                                      -2, -1, -0, 0, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 64,             // Numbers around 0 with special case of -0 which is not an integer
+                                       127, 128, 129,                                                    // 2**7
+                                       255, 256, 257,                                                    // 2**8
+                                       512, 1000, 1024, 4096, 10000,                                     // Misc numbers
+@@ -82,7 +82,7 @@ public class JavaScriptEnvironment: ComponentBase, Environment {
+         registerObjectGroup(.jsSets)
+         registerObjectGroup(.jsWeakSets)
+         registerObjectGroup(.jsArrayBuffers)
+-        for variant in ["Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "Uint8ClampedArray"] {
++        for variant in ["Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "Uint8ClampedArray", "BigInt64Array", "BigUint64Array"] {
+             registerObjectGroup(.jsTypedArrays(variant))
+         }
+         registerObjectGroup(.jsDataViews)
+@@ -93,6 +93,7 @@ public class JavaScriptEnvironment: ComponentBase, Environment {
+         registerObjectGroup(.jsSymbolConstructor)
+         registerObjectGroup(.jsBooleanConstructor)
+         registerObjectGroup(.jsNumberConstructor)
++        registerObjectGroup(.jsBigIntConstructor)
+         registerObjectGroup(.jsMathObject)
+         registerObjectGroup(.jsJSONObject)
+         registerObjectGroup(.jsReflectObject)
+@@ -111,10 +112,11 @@ public class JavaScriptEnvironment: ComponentBase, Environment {
+         registerBuiltin("String", ofType: .jsStringConstructor)
+         registerBuiltin("Boolean", ofType: .jsBooleanConstructor)
+         registerBuiltin("Number", ofType: .jsNumberConstructor)
++        registerBuiltin("BigInt", ofType: .jsBigIntConstructor)
+         registerBuiltin("Symbol", ofType: .jsSymbolConstructor)
+         registerBuiltin("RegExp", ofType: .jsRegExpConstructor)
+         registerBuiltin("ArrayBuffer", ofType: .jsArrayBufferConstructor)
+-        for variant in ["Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "Uint8ClampedArray"] {
++        for variant in ["Uint8Array", "Int8Array", "Uint16Array", "Int16Array", "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "Uint8ClampedArray", "BigInt64Array", "BigUint64Array"] {
+             registerBuiltin(variant, ofType: .jsTypedArrayConstructor(variant))
+         }
+         registerBuiltin("DataView", ofType: .jsDataViewConstructor)
+@@ -145,6 +147,7 @@ public class JavaScriptEnvironment: ComponentBase, Environment {
+         // Register pseudo builtins
+         registerBuiltin("this", ofType: .object())
+         registerBuiltin("arguments", ofType: .object())
++        registerBuiltin("globalThis", ofType: .object())
+         
+         for (builtin, type) in additionalBuiltins {
+             registerBuiltin(builtin, ofType: type)
+@@ -312,6 +315,9 @@ public extension Type {
+     /// Type of the JavaScript Number constructor builtin.
+     static let jsNumberConstructor = Type.functionAndConstructor([.anything] => .number) + .object(ofGroup: "NumberConstructor", withProperties: ["prototype", "EPSILON", "MAX_SAFE_INTEGER", "MAX_VALUE", "MIN_SAFE_INTEGER", "MIN_VALUE", "NaN", "NEGATIVE_INFINITY", "POSITIVE_INFINITY"], withMethods: ["isNaN", "isFinite", "isInteger", "isSafeInteger"])
+     
++    /// Type of the JavaScript BigInt constructor builtin.
++    static let jsBigIntConstructor = Type.functionAndConstructor([.anything] => .number) + .object(ofGroup: "BigIntConstructor", withProperties: ["prototype"], withMethods: ["asIntN", "asUintN", "toLocaleString"])
++    
+     /// Type of the JavaScript Symbol constructor builtin.
+     static let jsSymbolConstructor = Type.function([.string] => .jsSymbol) + .object(ofGroup: "SymbolConstructor", withProperties: ["iterator", "asyncIterator", "match", "matchAll", "replace", "search", "split", "hasInstance", "isConcatSpreadable", "unscopable", "species", "toPrimitive", "toStringTag"], withMethods: ["for", "keyFor"])
+     
+@@ -797,6 +803,20 @@ public extension ObjectGroup {
+         ]
+     )
+     
++    /// Object group modelling the JavaScript Number constructor builtin
++    static let jsBigIntConstructor = ObjectGroup(
++        name: "BigIntConstructor",
++        instanceType: .jsBigIntConstructor,
++        properties: [
++            "prototype"         : .object(),
++        ],
++        methods: [
++            "asIntN"            : [.number, .number] => .number,
++            "asUintN"           : [.number, .number] => .number,
++            "toLocaleString"    : [] => .string,
++        ]
++    )
++    
+     /// Object group modelling the JavaScript Math builtin
+     static let jsMathObject = ObjectGroup(
+         name: "Math",
+diff --git a/Sources/Fuzzilli/FuzzIL/AbstractInterpreter.swift b/Sources/Fuzzilli/FuzzIL/AbstractInterpreter.swift
+index 3127b9f..7e26f00 100644
+--- a/Sources/Fuzzilli/FuzzIL/AbstractInterpreter.swift
++++ b/Sources/Fuzzilli/FuzzIL/AbstractInterpreter.swift
+@@ -296,6 +296,8 @@ public struct AbstractInterpreter {
+             case .LogicAnd,
+                  .LogicOr:
+                 set(instr.output, .boolean)
++            case .NullishC:
++                set(instr.output, .primitive)
+             }
+             
+         case is TypeOf:
+diff --git a/Sources/Fuzzilli/FuzzIL/Operations.swift b/Sources/Fuzzilli/FuzzIL/Operations.swift
+index 1ba410f..f27521e 100644
+--- a/Sources/Fuzzilli/FuzzIL/Operations.swift
++++ b/Sources/Fuzzilli/FuzzIL/Operations.swift
+@@ -425,13 +425,14 @@ public enum BinaryOperator: String {
+     case Xor      = "^"
+     case LShift   = "<<"
+     case RShift   = ">>"
++    case NullishC = "??"
+     
+     var token: String {
+         return self.rawValue
+     }
+ }
+ 
+-let allBinaryOperators: [BinaryOperator] = [.Add, .Sub, .Mul, .Div, .Mod, .BitAnd, .BitOr, .LogicAnd, .LogicOr, .LShift, .RShift]
++let allBinaryOperators: [BinaryOperator] = [.Add, .Sub, .Mul, .Div, .Mod, .BitAnd, .BitOr, .LogicAnd, .LogicOr, .LShift, .RShift, .NullishC]
+ 
+ class BinaryOperation: Operation, TypeIdentifiable {
+     static let typeId = 32
+diff --git a/Sources/Fuzzilli/Lifting/JavaScriptLifter.swift b/Sources/Fuzzilli/Lifting/JavaScriptLifter.swift
+index 608e1b3..171dcdf 100644
+--- a/Sources/Fuzzilli/Lifting/JavaScriptLifter.swift
++++ b/Sources/Fuzzilli/Lifting/JavaScriptLifter.swift
+@@ -35,7 +35,7 @@ public class JavaScriptLifter: ComponentBase, Lifter {
+     /// The version of the ECMAScript standard that this lifter generates code for.
+     let version: ECMAScriptVersion
+ 
+-    public init(prefix: String = "", suffix: String = "", inliningPolicy: InliningPolicy, globalObjectIdentifier: String = "this") {
++    public init(prefix: String = "", suffix: String = "", inliningPolicy: InliningPolicy, globalObjectIdentifier: String = "globalThis") {
+         self.prefix = prefix
+         self.suffix = suffix
+         self.policy = inliningPolicy
+diff --git a/Sources/FuzzilliCli/Profiles/V8Profile.swift b/Sources/FuzzilliCli/Profiles/V8Profile.swift
+index 7a75004..5e0b975 100644
+--- a/Sources/FuzzilliCli/Profiles/V8Profile.swift
++++ b/Sources/FuzzilliCli/Profiles/V8Profile.swift
+@@ -16,14 +16,38 @@ import Fuzzilli
+ 
+ fileprivate func ForceV8TurbofanGenerator(_ b: ProgramBuilder) {
+     let f = b.randVar(ofType: .function())
+-    let arguments = b.generateCallArguments(for: f)
++    if !b.isInFunction {
++        let arguments = b.generateCallArguments(for: f)
++        
++        let start = b.loadInt(0)
++        let end = b.loadInt(Int.random(in: 100 ... 20000)) // Random up to 20k as sometimes TurboFan doesn't optimise with 100.
++        let step = b.loadInt(1)
++        b.forLoop(start, .lessThan, end, .Add, step) { _ in
++            b.callFunction(f, withArgs: arguments)
++        }
++    }
++}
++
++fileprivate func AimForTypeConfusion(_ b: ProgramBuilder) {
++    let f = b.defineFunction(withSignature: FunctionSignature(withParameterCount: Int.random(in: 2...5), hasRestParam: probability(0.4)), isJSStrictMode: probability(0.2)) { _ in
++        b.generate(n: 5)
++        let array = b.randVar(ofType: .object()) // maybe .jsArray?
++        let index = b.genIndex()
++        b.loadElement(index, of: array)
++        b.doReturn(value: b.randVar())
++    }
++    let initialArgs = b.generateCallArguments(for: f)
++    let optimisationArgs = b.generateCallArguments(for: f)
++    let triggeredArgs = b.generateCallArguments(for: f)
++
++    b.callFunction(f, withArgs: initialArgs)
+     
+-    let start = b.loadInt(0)
+-    let end = b.loadInt(100)
+-    let step = b.loadInt(1)
+-    b.forLoop(start, .lessThan, end, .Add, step) { _ in
+-        b.callFunction(f, withArgs: arguments)
++    // Ensure optimisation - watch out with timeouts! 
++    b.forLoop(b.loadInt(0), .lessThan, b.loadInt(Int.random(in: 100 ... 20000)), .Add, b.loadInt(1)) { _ in
++        b.callFunction(f, withArgs: optimisationArgs)
+     }
++
++    b.callFunction(f, withArgs: triggeredArgs)
+ }
+ 
+ let v8Profile = Profile(
+@@ -53,6 +77,7 @@ let v8Profile = Profile(
+     
+     additionalCodeGenerators: WeightedList<CodeGenerator>([
+         (ForceV8TurbofanGenerator, 10),
++        (AimForTypeConfusion, 20),
+     ]),
+     
+     additionalBuiltins: [
+diff --git a/Sources/FuzzilliCli/TerminalUI.swift b/Sources/FuzzilliCli/TerminalUI.swift
+index fddffeb..dd341f9 100644
+--- a/Sources/FuzzilliCli/TerminalUI.swift
++++ b/Sources/FuzzilliCli/TerminalUI.swift
+@@ -1,4 +1,4 @@
+-// Copyright 2019 Google LLC
++// Copyright 2020 Google LLC
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+@@ -19,46 +19,100 @@ let Seconds = 1.0
+ let Minutes = 60.0 * Seconds
+ let Hours   = 60.0 * Minutes
+ 
++// Keep track of the coverage to determine progress over time
++var oldCoverage = 0.0
++var TicksNewCoverage = 0
++
+ // A very basic terminal UI.
+ class TerminalUI {
+     // If set, the next program generated by the fuzzer will be printed to the screen.
+     var printNextGeneratedProgram: Bool
++
+     
+     init(for fuzzer: Fuzzer) {
+         printNextGeneratedProgram = false
+-        
++
+         // Event listeners etc. have to be registered on the fuzzer's queue
+         fuzzer.queue.addOperation {
+             self.initOnFuzzerQueue(fuzzer)
+             
+         }
+     }
+-    
++
++    // This print just gives us a bit more buffer
++    func printUpdate(_ statusUpdate: String) {
++        print()
++        print(statusUpdate) 
++    }
++
++    /*
++    import Darwin
++    import Dispatch
++
++    var w = winsize()
++    if ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 {
++        print("rows:", w.ws_row, "cols", w.ws_col)
++    }
++
++    let sigwinchSrc = DispatchSource.makeSignalSource(signal: SIGWINCH, queue: .main)
++    sigwinchSrc.setEventHandler {
++        if ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 {
++            print("rows:", w.ws_row, "cols", w.ws_col)
++        }
++    }
++    sigwinchSrc.resume()
++
++    dispatchMain()
++    */
++    var statusmsgArray = [""]
++
+     func initOnFuzzerQueue(_ fuzzer: Fuzzer) {
+         // Register log event listener now to be able to print log messages
+         // generated during fuzzer initialization
++
++
++        // Clear screen on the beginning for good printing of stats
++        print("\u{001B}[2J")
++
+         fuzzer.events.Log.observe { (creator, level, label, msg) in
+             let color = self.colorForLevel[level]!
++            // The whole space that we have for status messages
++            
+             if creator == fuzzer.id {
+-                print("\u{001B}[0;\(color.rawValue)m[\(label)] \(msg)\u{001B}[0;\(Color.reset.rawValue)m")
++                if level == .fatal {
++                    print("\u{001B}[2K\u{001B}[0;\(color.rawValue)m[\(label)] \(msg)\u{001B}[0;\(Color.reset.rawValue)m")    
++                }
++                self.statusmsgArray.append("\u{001B}[2K\u{001B}[0;\(color.rawValue)m[\(label)] \(msg)\u{001B}[0;\(Color.reset.rawValue)m")
+             } else {
+                 // Mark message as coming from a worker by including its id
+                 let shortId = creator.uuidString.split(separator: "-")[0]
+-                print("\u{001B}[0;\(color.rawValue)m[\(shortId):\(label)] \(msg)\u{001B}[0;\(Color.reset.rawValue)m")
++                if level == .fatal {
++                    print("\u{001B}[2K\u{001B}[0;\(color.rawValue)m[\(shortId):\(label)] \(msg)\u{001B}[0;\(Color.reset.rawValue)m")
++                }
++                self.statusmsgArray.append("\u{001B}[2K\u{001B}[0;\(color.rawValue)m[\(shortId):\(label)] \(msg)\u{001B}[0;\(Color.reset.rawValue)m")
++            }
++
++            // Space for printing
++            let msgRowsSpace: Int = 53 - 22
++            // Cleanup of the array elements
++            
++            self.statusmsgArray = self.statusmsgArray.filter({ $0 != ""})
++            while self.statusmsgArray.count > msgRowsSpace {
++                self.statusmsgArray.remove(at:0)
+             }
+         }
+         
+         fuzzer.events.CrashFound.observe { crash in
+             if crash.isUnique {
+-                print("########## Unique Crash Found ##########")
+-                print(fuzzer.lifter.lift(crash.program))
++                self.printUpdate("########## Unique Crash Found ##########")
++                self.printUpdate(fuzzer.lifter.lift(crash.program))
+             }
+         }
+         
+         fuzzer.events.ProgramGenerated.observe { program in
+             if self.printNextGeneratedProgram {
+-                print("--------- Generated Program -----------")
+-                print(fuzzer.lifter.lift(program, withOptions: [.dumpTypes]))
++                self.printUpdate("--------- Generated Program -----------")
++                self.printUpdate(fuzzer.lifter.lift(program, withOptions: [.dumpTypes]))
+                 self.printNextGeneratedProgram = false
+             }
+         }
+@@ -67,12 +121,12 @@ class TerminalUI {
+         fuzzer.events.Initialized.observe {
+             if let stats = Statistics.instance(for: fuzzer) {
+                 fuzzer.events.Shutdown.observe {
+-                    print("\n++++++++++ Fuzzer Finished ++++++++++\n")
+                     self.printStats(stats.compute(), of: fuzzer)
++                    print("\n++++++++++ Fuzzer Finished ++++++++++\n")
+                 }
+                 
+                 // We could also run our own timer on the main queue instead if we want to
+-                fuzzer.timers.scheduleTask(every: 60 * Seconds) {
++                fuzzer.timers.scheduleTask(every: 1 * Seconds) {
+                     self.printStats(stats.compute(), of: fuzzer)
+                     print()
+                 }
+@@ -81,23 +135,60 @@ class TerminalUI {
+     }
+     
+     func printStats(_ stats: Statistics.Data, of fuzzer: Fuzzer) {
++        print("\u{001B}[0;0H\u{001B}[2K") // move to 0, 0 on the terminal and clean that part
++        
++        var CoverageColor = ""
++        var CrashingColor = ""
++
++        // TODO: Move this to the right part; assuming where all the "stats" are defined
++        // Check how many "ticks" ago the coverage hasn't changed
++        if oldCoverage == stats.coverage {
++            TicksNewCoverage += 1
++        } else {
++            // If the coverage is updated then reset the counter
++            TicksNewCoverage = 0
++        }
++        // Save the current coverage
++        oldCoverage = stats.coverage
++
++        // Colours for Low, Mid, Good coverage (Red, Blue, Green)
++        switch stats.coverage {
++            case 0.10...0.29:
++                CoverageColor = "\u{001B}[0;34m"
++            case 0.29...1.00:
++                CoverageColor = "\u{001B}[0;32m"
++            default:
++                CoverageColor = "\u{001B}[0;31m"
++        }
++        // Red colour in case there's a crash
++        if stats.crashingSamples != 0 {
++            CrashingColor = "\u{001B}[0;31m"
++        }
++
++        // Print the actual stats
+         print("""
+-        Fuzzer Statistics
+-        -----------------
+-        Total Samples:                \(stats.totalSamples)
+-        Interesting Samples Found:    \(stats.interestingSamples)
+-        Valid Samples Found:          \(stats.validSamples)
+-        Corpus Size:                  \(fuzzer.corpus.size)
+-        Success Rate:                 \(String(format: "%.2f%%", stats.successRate * 100))
+-        Timeout Rate:                 \(String(format: "%.2f%%", stats.timeoutRate * 100))
+-        Crashes Found:                \(stats.crashingSamples)
+-        Timeouts Hit:                 \(stats.timedOutSamples)
+-        Coverage:                     \(String(format: "%.2f%%", stats.coverage * 100))
+-        Avg. program size:            \(String(format: "%.2f", stats.avgProgramSize))
+-        Connected workers:            \(stats.numWorkers)
+-        Execs / Second:               \(String(format: "%.2f", stats.execsPerSecond))
+-        Total Execs:                  \(stats.totalExecs)
++        \u{001B}[2KFuzzer Statistics
++        \u{001B}[2K-----------------
++        \u{001B}[2KCoverage:                     \(CoverageColor)\(String(format: "%.2f%%", stats.coverage * 100))\u{001B}[0;0m
++        \u{001B}[2KCoverage Last Updated:        \(TicksNewCoverage)
++        \u{001B}[2KTotal Samples:                \(stats.totalSamples)
++        \u{001B}[2KInteresting Samples Found:    \(stats.interestingSamples)
++        \u{001B}[2KValid Samples Found:          \(stats.validSamples)
++        \u{001B}[2KCorpus Size:                  \(fuzzer.corpus.size)
++        \u{001B}[2KSuccess Rate:                 \(String(format: "%.2f%%", stats.successRate * 100))
++        \u{001B}[2KTimeout Rate:                 \(String(format: "%.2f%%", stats.timeoutRate * 100))
++        \u{001B}[2KDonatepies:                   \(CrashingColor)\(stats.crashingSamples)\u{001B}[0;0m
++        \u{001B}[2KTimeouts Hit:                 \(stats.timedOutSamples)
++        \u{001B}[2KAvg. program size:            \(String(format: "%.2f", stats.avgProgramSize))
++        \u{001B}[2KConnected workers:            \(stats.numWorkers)
++        \u{001B}[2KExecs / Second:               \(String(format: "%.2f", stats.execsPerSecond))
++        \u{001B}[2KTotal Execs:                  \(stats.totalExecs)
+         """)
++        print("\u{001B}[2K-----------STATUS MESSAGES---------------")
++           
++        for msg in self.statusmsgArray {
++            msg.count > 180 ? print("\(msg.prefix(180)) ...\u{001B}[0;\(Color.reset.rawValue)m") : print("\(msg)")
++        }
+     }
+     
+     private enum Color: Int {
+diff --git a/Sources/FuzzilliCli/main.swift b/Sources/FuzzilliCli/main.swift
+index 0e32fe5..22fb4ff 100644
+--- a/Sources/FuzzilliCli/main.swift
++++ b/Sources/FuzzilliCli/main.swift
+@@ -197,7 +197,7 @@ fuzzer.queue.addOperation {
+ 
+     // Store samples to disk if requested.
+     if let path = storagePath {
+-        let stateExportInterval = exportState ? 6 * Hours : nil
++        let stateExportInterval = exportState ? 0.5 * Hours : nil
+         fuzzer.addModule(Storage(for: fuzzer, storageDir: path, stateExportInterval: stateExportInterval))
+     }
+ 
+ 
